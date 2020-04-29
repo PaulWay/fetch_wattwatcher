@@ -8,6 +8,7 @@ verify_ssl = true
 [packages]
 requests = "*"
 pyyaml = "*"
+influxdb = "*"
 
 [requires]
 python_version = "3.7"
