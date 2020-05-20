@@ -4,7 +4,8 @@
 # Licensed under version 3 of the GPL.
 
 import argparse
-from datetime import datetime, timedelta
+from datetime import datetime
+import glob
 from influxdb import InfluxDBClient
 import json
 from os import environ, path
@@ -15,7 +16,7 @@ import yaml
 
 ####################
 # Constants and defaults
-config_location='settings.yaml'
+config_location = 'settings.yaml'
 
 ####################
 # Global variables
@@ -23,26 +24,16 @@ args = None
 config = dict()
 ww_headers = dict()
 ww_base_url = 'https://api-v3.wattwatchers.com.au'
+ww_file_pattern = "wattwatcher_{s}-{f}_{g}.json"
 pv_headers = dict()
+pv_status_url = 'https://pvoutput.org/service/r2/addstatus.jsp'
 device_info = dict()
 influx_client = None
+usage_storage = dict()
 
 
 def pwrap(*args):
     print(textwrap.fill(*args))
-
-
-def parse_arguments():
-    global args
-    parser = argparse.ArgumentParser(
-        description='Fetch, manipulate and store WattWatcher Auditor data'
-    )
-    parser.add_argument(
-        '--config-file', '-f', action='store',
-        default=config_location,
-        help='The YAML configuration file'
-    )
-    args = parser.parse_args()
 
 
 def read_config():
@@ -58,7 +49,9 @@ def read_config():
         print("Error: 'wattwatchers' section not in config file.")
         exit(1)
     if not isinstance(config['wattwatchers'], dict):
-        print("Error: 'wattwatchers' section in config file is not a dictionary.")
+        print(
+            "Error: 'wattwatchers' section in config file is not a dictionary."
+        )
         exit(1)
     if 'pvoutput' not in config:
         print("Error: 'pvoutput' section not in config file.")
@@ -68,7 +61,9 @@ def read_config():
         exit(1)
 
     global ww_headers, ww_base_url
-    ww_api_key = environ.get('WATTWATCHER_API_KEY', config['wattwatchers']['api_key'])
+    ww_api_key = environ.get(
+        'WATTWATCHER_API_KEY', config['wattwatchers']['api_key']
+    )
     if 'base_url' in config['wattwatchers']:
         ww_base_url = config['wattwatchers']['base_url']
     if not (ww_api_key and ww_api_key.startswith('key_')):
@@ -90,8 +85,11 @@ def read_config():
             "or use environment variable PVOUTPUT_API_KEY."
         )
         exit(1)
-    if 'system_id' not in config['pvoutput']:
-        print("Error: PVOutput System ID not set in 'system_id' key in pvoutput config")
+    if 'pvoutput' in config and 'system_id' not in config['pvoutput']:
+        print(
+            "Error: PVOutput System ID not set in 'system_id' key in pvoutput "
+            "config"
+        )
         exit(1)
 
 
@@ -129,9 +127,11 @@ def ww_api_get(endpoint, parameters=None):
         headers=ww_headers
     )
     if response.status_code != 200:
-        pwrap(f"Error: GET {endpoint} returned status {response.status_code} - {response.data}")
+        pwrap(
+            f"Error: GET {endpoint} returned status {response.status_code} - "
+            f"{response.data}"
+        )
         exit(1)
-    # print(f"GET {endpoint} returned {response.status_code}: {response.json()}")
     return response.json()
 
 
@@ -173,8 +173,10 @@ def device_channel_data(device, channel):
         else:
             pwrap(
                 f"Warning: could not find channel labelled '{channel}' "
-                f"in device {device} - we know about "
-                f"{', '.join(chan['label'] for chan in device_info[device]['channels'])}"
+                f"in device {device} - we know about ",
+                ', '.join(
+                    chan['label'] for chan in device_info[device]['channels']
+                )
             )
             return {}
     return channel_data
@@ -294,14 +296,23 @@ def get_daily_usage(resolution='5m'):
     finit = int(now.replace(hour=23, minute=59, second=59).timestamp())
     usage_data = {  # otherwise organised by timestamp to combine channels
         '_metadata_': {
-            'start_ts': start, 'finish_ts': finit, 'granularity': resolution
+            'start_ts': start, 'finish_ts': finit,
+            'captured_ts': now.timestamp(), 'granularity': resolution,
         }
     }
+    min_found_ts = 0
+    max_found_ts = 0
     for device, device_data in device_info.items():
         device_usage_data = ww_api_get(
             'long-energy/' + device,
             {'fromTs': start, 'toTs': finit, 'granularity': resolution}
         )
+        # Get the minimum and maximum actual time stamps from the first
+        # and last samples of the first channel of data we find
+        if min_found_ts == 0:
+            min_found_ts = int(device_usage_data[0]['timestamp'])
+        if max_found_ts == 0:
+            max_found_ts = int(device_usage_data[-1]['timestamp'])
         # Data comes back in lists, one item per channel; we want to
         # rearrange that into usage[channel][timestamp][field] - since
         # the channel shouldn't already be in there.
@@ -322,6 +333,10 @@ def get_daily_usage(resolution='5m'):
             usage_data[channel]['_metadata_'] = {
                 'device': device
             }
+    if min_found_ts > 0:
+        usage_data['_metadata_']['found_start_ts'] = min_found_ts
+    if max_found_ts > 0:
+        usage_data['_metadata_']['found_finish_ts'] = max_found_ts
     print("Got usage data - keys:", usage_data.keys())
     return usage_data
 
@@ -334,9 +349,51 @@ def store_usage_data_in_data_dir(usage_data, data_dir):
     - e.g. wattwatcher_1550408400_1550494800_5m.json
     """
     meta = usage_data['_metadata_']
-    filename = f"wattwatcher_{meta['start_ts']}-{meta['finish_ts']}-{meta['granularity']}.json"
+    # Here we should NOT trust the metadata of the start and finish timestamps
+    # that were *requested*, we should trust what we *actually got*.
+    if 'found_start_ts' not in meta or 'found_finish_ts' not in meta:
+        pwrap(
+            f"Warning: cannot save usage data - while it was requested from "
+            f"{meta['start_ts']}-{meta['finish_ts']}, there were no actual "
+            f"samples found in the returned data.  Will not save this file."
+        )
+        return
+    filename = ww_file_pattern.format(
+        s=meta['found_start_ts'], f=meta['found_finish_ts'],
+        g=meta['granularity']
+    )
     with open(path.join(data_dir, filename), 'w') as fh:
         json.dump(usage_data, fh)
+
+
+def load_usage_data_from_data_dir(
+    data_dir, start_ts, finish_ts=None, granularity='5m'
+):
+    """
+    Load data from a file with these dates and granularity from the file
+    system.  There must be a file with the given start time; if 'finish_ts'
+    is left as None, the file with that start time and the largest finish
+    time possible will be loaded.
+    """
+    if finish_ts is None:
+        file_glob = ww_file_pattern.format(
+            s=start_ts, f='*', g=granularity
+        )
+        matching_files = glob.glob(path.join(data_dir, file_glob))
+        if not matching_files:
+            pwrap(
+                f"Could not find any file named '{file_glob}' in '{data_dir}' "
+                f"to match starting timestamp '{start_ts}'"
+            )
+            return {}
+        # Last one in sorted order will be with last matching end date
+        filename = sorted(matching_files)[-1]
+    else:
+        filename = ww_file_pattern.format(
+            s=start_ts, f=finish_ts, g=granularity
+        )
+    with open(path.join(data_dir, filename)) as fh:
+        return json.load(fh)
 
 
 def store_usage_data_in_influxdb(usage_data):
@@ -361,17 +418,113 @@ def store_usage_data_in_influxdb(usage_data):
     ]
     print("Data points mangled into:", data_points)
     set_up_influxdb(config['influxdb'])
+    global influxdb
     influxdb.write_points(data_points, time_precision='s')
 
 
-if __name__ == '__main__':
-    parse_arguments()
-    read_config()
+def store_channel_to_pvoutput(usage_data, pv_channel):
+    """
+    Find a particular channel of usage data and store that in PVOutput.
+    """
+    pv_headers = {
+        'X-Pvoutput-Apikey': config['pvoutput']['api_key'],
+        'X-Pvoutput-SystemId': config['pvoutput']['system_id'],
+    }
+    if pv_channel not in usage_data:
+        pwrap(
+            f"Warning: channel '{pv_channel}' specified in config but not "
+            f"found in usage data"
+        )
+        return
+    parameters = {
+        'd': 'date', 't': 'time',
+        'v1': 'watt hours generated', 'v3': 'watt hours consumed',
+        'v6': 'mean volts RMS',
+    }
+    # At this time post all the timestamps of data we've got
+    response = requests.post(
+        pv_status_url,
+        data=parameters,
+        headers=pv_headers
+    )
+    assert response.status_code == 200
+
+
+def fetch_today():
+    """
+    Just fetch today's data from the WattWatcher site.
+    """
     get_devices()
-    # usage = get_device_daily_usage('ED055CC1AF588')
     usage_data = get_daily_usage()
     if 'storage' in config and 'data_dir' in config['storage']:
         store_usage_data_in_data_dir(usage_data, config['storage']['data_dir'])
-    if 'influxdb' in config and config['influxdb'].get('enabled', 'true') == 'true':
+    return usage_data
+
+
+def fetch_all_data():
+    """
+    Fetch all data, from the first day we can to now.
+    """
+    get_devices()
+    #
+    # if 'storage' in config and 'data_dir' in config['storage']:
+    #     store_usage_data_in_data_dir(
+    #         usage_data, config['storage']['data_dir']
+    #     )
+
+
+def push_pvoutput():
+    usage_data = fetch_today()
+    if all(
+        'pvoutput' in config,
+        'wattwatcher_channel' in config['pvoutput'],
+        config['pvoutput'].get('enabled', 'true') == 'true'
+    ):
+        store_channel_to_pvoutput(
+            usage_data, config['pvoutput']['wattwatcher_channel']
+        )
+
+
+def push_influxdb():
+    usage_data = fetch_today()
+    if all(
+        'influxdb' in config,
+        config['influxdb'].get('enabled', 'true') == 'true'
+    ):
         store_usage_data_in_influxdb(usage_data)
-    # if 'pvoutput' in config and 'wattwatcher_device' in config['pvoutput'] and 'wattwatcher_channel' in config['pvoutput']:
+
+
+####################
+# Modes and function to execute them
+modes = {
+    'fetch': fetch_today,
+    'fetch-all': fetch_all_data,
+    'push-pvoutput': push_pvoutput,
+    'push-influxdb': push_influxdb,
+}
+
+
+def parse_arguments():
+    global args
+    parser = argparse.ArgumentParser(
+        description='Fetch, manipulate and store WattWatcher Auditor data'
+    )
+    parser.add_argument(
+        '--config-file', '-f', action='store',
+        default=config_location,
+        help='The YAML configuration file'
+    )
+    parser.add_argument(
+        'mode', default='fetch', choices=modes,
+        help='What to do'
+    )
+    args = parser.parse_args()
+
+
+####################
+# Main code
+if __name__ == '__main__':
+    parse_arguments()
+    read_config()
+    # Call mode function
+    modes[args.mode]()
