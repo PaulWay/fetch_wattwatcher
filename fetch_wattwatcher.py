@@ -4,19 +4,24 @@
 # Licensed under version 3 of the GPL.
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 import glob
 from influxdb import InfluxDBClient
 import json
 from os import environ, path
 import requests
 import textwrap
+import time
 import yaml
 
 
 ####################
 # Constants and defaults
 config_location = 'settings.yaml'
+valid_granularities = {'5m': 300, '15m': 900, '30m': 1800, 'hour': 3600}
+valid_grain_list = sorted(
+    valid_granularities.keys(), key=lambda g: valid_granularities[g]
+)
 
 ####################
 # Global variables
@@ -28,6 +33,7 @@ ww_file_pattern = "wattwatcher_{s}-{f}_{g}.json"
 pv_headers = dict()
 pv_status_url = 'https://pvoutput.org/service/r2/addstatus.jsp'
 device_info = dict()
+channel_info = dict()
 influx_client = None
 usage_storage = dict()
 
@@ -143,74 +149,29 @@ def get_devices():
     assert isinstance(devices, list), f'got devices {devices}'
     # Get the device info for each device
     global device_info
-    device_info = {}
+    device_info = dict()
+    global channel_info
+    channel_info = dict()
     for device in devices:
         device_info[device] = ww_api_get('devices/' + device)
-        print(f"Device {device} channels: {device_info[device]['channels']}")
+        for channel_no, channel_data in enumerate(device_info[device]['channels']):
+            channel_name = channel_data['label']
+            # print(f"Got channel {channel_name} on device {device} port {channel_no} (from 0)")
+            channel_info[channel_name] = channel_data
+            channel_info[channel_name]['device'] = device
+            channel_info[channel_name]['index'] = channel_no
 
 
-def device_channel_data(device, channel):
+def day_extents_timestamps(date=None):
     """
-    Look up the channel data from a device by channel number or name
+    Get the start and finish timestamps for a date, or today if no date
+    specified.
     """
-    if 'channels' not in device_info[device]:
-        print(f"Error: no 'channels' section in device info for {device}")
-        return
-    if isinstance(channel, int):
-        # Look for channel by number, starting from channel 1
-        if channel - 1 > len(device_info[device]['channels']):
-            pwrap(
-                f"Warning: channel {channel} not found in channels of "
-                f"{device}: {len(device_info[device]['channels'])} known"
-            )
-            return {}
-        channel_data = device_info[device]['channels'][channel + 1]
-    elif isinstance(channel, str):
-        # Look for channel by name:
-        for channel_data in device_info[device]['channels']:
-            if channel_data['label'] == channel:
-                break
-        else:
-            pwrap(
-                f"Warning: could not find channel labelled '{channel}' "
-                f"in device {device} - we know about ",
-                ', '.join(
-                    chan['label'] for chan in device_info[device]['channels']
-                )
-            )
-            return {}
-    return channel_data
-
-
-def get_device_daily_usage(device, resolution='5m'):
-    """
-    Get the power usage from this device for today, at the given
-    resolution (which can be one of '5m', '15m', '30m', or 'hour').
-    """
-    if device not in device_info:
-        pwrap(
-            f"Warning: device {device} not found in data from "
-            f"WattWatchers - we know about {', '.join(device_info.keys())}"
-        )
-        return None
-    valid_resolutions = ('5m', '15m', '30m', 'hour')
-    if resolution not in valid_resolutions:
-        pwrap(
-            f"Warning: resolution should be one of {valid_resolutions}"
-        )
-        return None
-    now = datetime.now()
-    # Probably a good point here to fetch from InfluxDB which samples
-    # we've already collected, and update our start timestamp.
-    start = int(now.replace(hour=0, minute=0, second=0).timestamp())
-    finit = int(now.replace(hour=23, minute=59, second=59).timestamp())
-    usage_data = ww_api_get(
-        'long-energy/' + device,
-        {'fromTs': start, 'toTs': finit, 'granularity': resolution}
-    )
-    # Data comes back
-    print("Got usage data", usage_data, "for device", device)
-    return usage_data
+    if date is None:
+        date = datetime.now()
+    start = int(date.replace(hour=0, minute=0, second=0).timestamp())
+    finit = int(date.replace(hour=23, minute=59, second=59).timestamp())
+    return (start, finit)
 
 
 def sample_to_fields(sample, pos):
@@ -241,13 +202,14 @@ def sample_to_fields(sample, pos):
     }
 
 
-def get_daily_usage(resolution='5m'):
+def ww_get_usage_for_range(start_ts, finit_ts, granularity='5m'):
     """
-    Get the power usage from all devices for today, at the given
-    resolution (which can be one of '5m', '15m', '30m', or 'hour').
-    The result is combined with metadata of the start and end time for this
-    day.  The results are stored per channel across all devices and are
-    rearranged into 'channel' -> 'timestamp' -> 'value' - something like this:
+    Get the power usage from all devices from the WattWatchers API for a
+    given time range at the given granularity (which can be one of '5m',
+    '15m', '30m', or 'hour'). The result is combined with metadata of the
+    start and end time for this period.  The results are stored per channel
+    across all devices and are rearranged into 'channel' -> 'timestamp' ->
+    'value' - something like this:
 
     {
       "House": {
@@ -283,21 +245,16 @@ def get_daily_usage(resolution='5m'):
     integer format.
 
     """
-    valid_resolutions = ('5m', '15m', '30m', 'hour')
-    if resolution not in valid_resolutions:
+    if granularity not in valid_granularities:
         pwrap(
-            f"Warning: resolution should be one of {valid_resolutions}"
+            f"Warning: granularity should be one of {valid_grain_list}"
         )
         return None
-    now = datetime.now()
-    # Probably a good point here to fetch from InfluxDB which samples
-    # we've already collected, and update our start timestamp.
-    start = int(now.replace(hour=0, minute=0, second=0).timestamp())
-    finit = int(now.replace(hour=23, minute=59, second=59).timestamp())
     usage_data = {  # otherwise organised by timestamp to combine channels
         '_metadata_': {
             'start_ts': start, 'finish_ts': finit,
-            'captured_ts': now.timestamp(), 'granularity': resolution,
+            'captured_ts': datetime.now().timestamp(),
+            'granularity': granularity,
         }
     }
     min_found_ts = 0
@@ -305,7 +262,7 @@ def get_daily_usage(resolution='5m'):
     for device, device_data in device_info.items():
         device_usage_data = ww_api_get(
             'long-energy/' + device,
-            {'fromTs': start, 'toTs': finit, 'granularity': resolution}
+            {'fromTs': start, 'toTs': finit, 'granularity': granularity}
         )
         # Get the minimum and maximum actual time stamps from the first
         # and last samples of the first channel of data we find
@@ -396,6 +353,58 @@ def load_usage_data_from_data_dir(
         return json.load(fh)
 
 
+def get_usage_for_range(start_ts, finish_ts, granularity='5m'):
+    """
+    Get a range of data at the specified granularity, somehow.  If this range
+    is covered by a file in our data directory, then use that.  If we have
+    InfluxDB enabled, query that (TODO - not implemented yet).  Otherwise,
+    fetch the range from the WattWatchers API.
+
+    To start with, we're going to assume each range is exactly one day in
+    length, and starts and finishes at the ends of that day - in other words,
+    as returned by `day_extents_timestamps()` above.  In the future, we might
+    support ranges that don't start or end on the day boundaries or span
+    multiple days.
+
+    We will, however, fetch extra data if we have a range that has been
+    started but not yet completed - e.g. a day that was previously partly
+    fetched.
+    """
+    usage_data = None
+    if 'storage' in config and 'data_dir' in config['storage']:
+        usage_data = load_usage_data_from_data_dir(
+            config['storage'], start_ts, finit_ts, granularity
+        )
+        meta = usage_data['_metadata_']
+        if not 'found_start_ts' in meta and not 'found_finish_ts' in meta:
+            # Nothing in this data segment - fetch and return it.
+            return ww_get_usage_for_range(start_ts, finit_ts, granularity)
+        # Maybe we need to fill later samples in this data?  Check that its
+        # metadata found start and end ranges are what we expect.  We only
+        # check the end of this range - if there aren't any samples before the
+        # start of the day, maybe this is the first day?
+        found_finish_ts = meta['found_finish_ts']
+        # range finish is 23:59:59 usually - round that down to the last
+        # granularity range
+        requested_finish_ts = finish_ts - valid_granularities[granularity] + 1
+        if found_finish_ts < requested_finish_ts:
+            rest_of_data = ww_get_usage_for_range(
+                found_finish_ts + valid_granularities[granularity],
+                finish_ts, granularity
+            )
+        # If we didn't get any more data, maybe we're requesting it too soon?
+        if not 'found_start_ts' in rest_of_data['_metadata_']:
+            # We can return our fetched data now
+            return usage_data
+        # Check a couple of things here
+        # assert meta['finish_ts'] < rest_of_data['_metadata_']['start_ts']
+        # Merge these together:
+        # meta['finish_ts'] =
+
+    if not usage_data:
+        return ww_get_usage_for_range(start_ts, finish_ts, granularity)
+
+
 def store_usage_data_in_influxdb(usage_data):
     """
     Store the usage data in InfluxDB.
@@ -413,7 +422,7 @@ def store_usage_data_in_influxdb(usage_data):
             'time': timestamp
         }
         for channel, channel_data in usage_data.items()
-        for timestamp, time_data in channel_data
+        for timestamp, time_data in channel_data.items()
         if channel != '_metadata_' and timestamp != '_metadata_'
     ]
     print("Data points mangled into:", data_points)
@@ -494,6 +503,96 @@ def push_influxdb():
         store_usage_data_in_influxdb(usage_data)
 
 
+def update_current():
+    # Current time, truncate to nearest 5 minutes
+    if 'pvoutput' not in config:
+        return
+    if 'generation_channel' not in config['pvoutput']:
+        return
+    pv_gen_channel = config['pvoutput']['generation_channel']
+    pv_con_channel = config['pvoutput'].get('consumption_channel', None)
+    get_devices()
+    if pv_gen_channel not in channel_info:
+        pwrap(
+            f"Warning: generation channel '{pv_gen_channel}' specified in "
+            f"config but not found in channel data from WattWatchers"
+        )
+        return
+    pv_gen_device = channel_info[pv_gen_channel]['device']
+    pv_gen_chan_no = channel_info[pv_gen_channel]['index']
+    print(f"Channel '{pv_gen_channel}' is device {pv_gen_device} port {pv_gen_chan_no}")
+    if pv_con_channel:
+        if pv_con_channel not in channel_info:
+            pwrap(
+                f"Warning: consumption channel '{pv_con_channel}' specified in "
+                f"config but not found in channel data from WattWatchers ("
+                f"{', '.join(sorted(channel_info.keys()))}) - ignoring"
+            )
+            pv_con_channel = None
+        else:
+            pv_con_device = channel_info[pv_con_channel]['device']
+            pv_con_chan_no = channel_info[pv_con_channel]['index']
+            if pv_con_device != pv_gen_device:
+                pwrap(
+                    f"Warning: at the moment we don't support the consumption "
+                    f"device for channel '{pv_con_channel}' (which is "
+                    f"'{pv_con_device}') being different from the generation "
+                    f"device ('{pv_gen_device}') for channel '{pv_gen_channel}' "
+                    f"- ignoring"
+                )
+                pv_con_channel = None
+            else:
+                print(f"Channel {pv_con_channel} is device: {pv_con_device} port {pv_con_chan_no}")
+    pv_headers = {
+        'X-Pvoutput-Apikey': config['pvoutput']['api_key'],
+        'X-Pvoutput-SystemId': str(config['pvoutput']['system_id']),
+    }
+
+    while True:
+        now = datetime.now()
+        end_of_period = now.replace(
+            minute=now.minute - now.minute % 5, second=0, microsecond=0
+        )
+        start_of_period = end_of_period - timedelta(minutes=5)
+        pvoutput_start = now
+        device_usage_data = ww_api_get(
+            'long-energy/' + pv_gen_device,
+            parameters={
+                'fromTs': start_of_period.timestamp(),
+                'toTs': end_of_period.timestamp(),
+            }
+        )
+        assert isinstance(device_usage_data, list)
+        datapoint = device_usage_data[0]
+        print(f"From WattWatchers got timestamp {datapoint['timestamp']} <=> {start_of_period.timestamp}")
+        print(f"... {datapoint['eReal'][pv_gen_chan_no]}J, min {datapoint['vRMSMin'][pv_gen_chan_no]} max {datapoint['vRMSMax'][pv_gen_chan_no]}")
+
+        # A Joule is a watt-second.
+        parameters = {
+            'd': start_of_period.strftime('%Y%m%d'), 't': start_of_period.time().strftime('%H:%M'),
+            'v1': datapoint['eReal'][pv_gen_chan_no] / 3600,
+            'v6': (
+                datapoint['vRMSMin'][pv_gen_chan_no] + datapoint['vRMSMax'][pv_gen_chan_no]
+            ) / 2,
+        }
+        if pv_con_channel:
+            parameters['v3'] = datapoint['eReal'][pv_con_chan_no] / 3600,
+        print("Parameters:", parameters)
+        # At this time post all the timestamps of data we've got
+        response = requests.post(
+            pv_status_url,
+            data=parameters,
+            headers=pv_headers
+        )
+        assert response.status_code == 200
+        print(response.content.decode())
+        # We want to sleep until a certain fudge factor past the five minute
+        # boundary, to allow for data to be transmitted to WattWatchers and
+        # calculated if necessary, as well as possible clock misalignment.
+        # Let's say 30 seconds past the end of the most recent period.
+        time.sleep(time.time() - end_of_period.timestamp() + 30)
+
+
 ####################
 # Modes and function to execute them
 modes = {
@@ -501,6 +600,7 @@ modes = {
     'fetch-all': fetch_all_data,
     'push-pvoutput': push_pvoutput,
     'push-influxdb': push_influxdb,
+    'update-current': update_current,
 }
 
 
