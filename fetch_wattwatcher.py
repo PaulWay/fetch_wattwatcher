@@ -550,33 +550,34 @@ def update_current():
 
     while True:
         now = datetime.now()
+        print(f"Now: {now} timestamp {now.timestamp()}")
         end_of_period = now.replace(
-            minute=now.minute - now.minute % 5, second=0, microsecond=0
+            minute=int(now.minute / 5) * 5, second=0, microsecond=0
         )
         start_of_period = end_of_period - timedelta(minutes=5)
-        pvoutput_start = now
+        print(f"Fetching data from {start_of_period} ({start_of_period.timestamp()}) to {end_of_period.timestamp()}")
         device_usage_data = ww_api_get(
-            'long-energy/' + pv_gen_device,
-            parameters={
-                'fromTs': start_of_period.timestamp(),
-                'toTs': end_of_period.timestamp(),
-            }
+            'long-energy/{device}?fromTs={fromTs}&toTs={toTs}'.format(
+                device=pv_gen_device,
+                fromTs=int(start_of_period.timestamp()),
+                toTs=int(end_of_period.timestamp()),
+            )
         )
         assert isinstance(device_usage_data, list)
         datapoint = device_usage_data[0]
-        print(f"From WattWatchers got timestamp {datapoint['timestamp']} <=> {start_of_period.timestamp}")
-        print(f"... {datapoint['eReal'][pv_gen_chan_no]}J, min {datapoint['vRMSMin'][pv_gen_chan_no]} max {datapoint['vRMSMax'][pv_gen_chan_no]}")
+        print(f"From WattWatchers got timestamp {datapoint['timestamp']} <=> {start_of_period.timestamp()}")
+        print(f"... {datapoint['eReal'][pv_gen_chan_no]}J = {datapoint['eReal'][pv_gen_chan_no] / datapoint['duration']}Wh, min {datapoint['vRMSMin'][pv_gen_chan_no]}V max {datapoint['vRMSMax'][pv_gen_chan_no]}V")
 
-        # A Joule is a watt-second.
+        # A Joule is a watt-second.  Divide by seconds in period.
         parameters = {
             'd': start_of_period.strftime('%Y%m%d'), 't': start_of_period.time().strftime('%H:%M'),
-            'v1': datapoint['eReal'][pv_gen_chan_no] / 3600,
+            'v1': datapoint['eReal'][pv_gen_chan_no] / datapoint['duration'],
             'v6': (
                 datapoint['vRMSMin'][pv_gen_chan_no] + datapoint['vRMSMax'][pv_gen_chan_no]
             ) / 2,
         }
         if pv_con_channel:
-            parameters['v3'] = datapoint['eReal'][pv_con_chan_no] / 3600,
+            parameters['v3'] = datapoint['eReal'][pv_con_chan_no] / datapoint['duration']
         print("Parameters:", parameters)
         # At this time post all the timestamps of data we've got
         response = requests.post(
@@ -584,13 +585,15 @@ def update_current():
             data=parameters,
             headers=pv_headers
         )
-        assert response.status_code == 200
         print(response.content.decode())
+        assert response.status_code == 200
         # We want to sleep until a certain fudge factor past the five minute
         # boundary, to allow for data to be transmitted to WattWatchers and
         # calculated if necessary, as well as possible clock misalignment.
         # Let's say 30 seconds past the end of the most recent period.
-        time.sleep(time.time() - end_of_period.timestamp() + 30)
+        delay=(end_of_period.timestamp() + 330) - time.time()
+        print(f"Sleeping {delay} seconds until {end_of_period + timedelta(seconds=330)}")
+        time.sleep(delay)
 
 
 ####################
