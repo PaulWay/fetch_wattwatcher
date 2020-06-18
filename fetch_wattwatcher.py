@@ -566,20 +566,31 @@ def update_current():
         assert isinstance(device_usage_data, list)
         datapoint = device_usage_data[0]
         print(f"From WattWatchers got timestamp {datapoint['timestamp']} <=> {start_of_period.timestamp()}")
-        print(f"... {datapoint['eReal'][pv_gen_chan_no]}J = {datapoint['eReal'][pv_gen_chan_no] / datapoint['duration']}Wh, min {datapoint['vRMSMin'][pv_gen_chan_no]}V max {datapoint['vRMSMax'][pv_gen_chan_no]}V")
+        print(
+            f"... generation: {datapoint['eRealPositive'][pv_gen_chan_no]}J = "
+            f"{datapoint['eRealPositive'][pv_gen_chan_no] / datapoint['duration']:.2f}W, "
+            f"min {datapoint['vRMSMin'][pv_gen_chan_no]}V max {datapoint['vRMSMax'][pv_gen_chan_no]}V"
+        )
+        if pv_con_channel:
+            print(
+                f"... consumption: {datapoint['eRealPositive'][pv_con_chan_no]:.2f}J = "
+                f"{datapoint['eRealPositive'][pv_gen_chan_no] / datapoint['duration']}W"
+            )
 
-        # A Joule is a watt-second.  Divide by seconds in period.
+
+        # NOTE: PVOutput doesn't let energy readings (WH) go below any previous
+        # reading.  So we have to push watts.
+        # A Joule is a watt-second.  Divide by seconds in period to get watts.
         parameters = {
             'd': start_of_period.strftime('%Y%m%d'), 't': start_of_period.time().strftime('%H:%M'),
-            'v1': datapoint['eReal'][pv_gen_chan_no] / datapoint['duration'],
-            'v6': (
+            'v2': int(datapoint['eRealPositive'][pv_gen_chan_no] / datapoint['duration']),
+            'v6': int((
                 datapoint['vRMSMin'][pv_gen_chan_no] + datapoint['vRMSMax'][pv_gen_chan_no]
-            ) / 2,
+            ) / 2),
         }
         if pv_con_channel:
-            parameters['v3'] = datapoint['eReal'][pv_con_chan_no] / datapoint['duration']
+            parameters['v4'] = int(datapoint['eRealPositive'][pv_con_chan_no] / datapoint['duration'])
         print("Parameters:", parameters)
-        # At this time post all the timestamps of data we've got
         response = requests.post(
             pv_status_url,
             data=parameters,
