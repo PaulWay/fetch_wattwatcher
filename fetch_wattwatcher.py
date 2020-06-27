@@ -29,9 +29,9 @@ args = None
 config = dict()
 ww_headers = dict()
 ww_base_url = 'https://api-v3.wattwatchers.com.au'
-ww_file_pattern = "wattwatcher_{s}-{f}_{g}.json"
+ww_file_pattern = "wattwatcher_{s:.0f}-{f:.0f}_{g}.json"
 pv_headers = dict()
-pv_status_url = 'https://pvoutput.org/service/r2/addstatus.jsp'
+pv_base_url = 'https://pvoutput.org/service/r2/'
 device_info = dict()
 channel_info = dict()
 influx_client = None
@@ -145,12 +145,15 @@ def get_devices():
     """
     Get the list of devices and get the information on each device
     """
+    global device_info
+    global channel_info
+    if device_info and channel_info:
+        # Work already done.
+        return
     devices = ww_api_get('devices')
     assert isinstance(devices, list), f'got devices {devices}'
     # Get the device info for each device
-    global device_info
     device_info = dict()
-    global channel_info
     channel_info = dict()
     for device in devices:
         device_info[device] = ww_api_get('devices/' + device)
@@ -245,6 +248,8 @@ def ww_get_usage_for_range(start_ts, finit_ts, granularity='5m'):
     integer format.
 
     """
+    if args.verbose:
+        print(f"Getting data from WattWatchers for {start_ts:.0f}..{finit_ts:.0f} per {granularity}")
     if granularity not in valid_granularities:
         pwrap(
             f"Warning: granularity should be one of {valid_grain_list}"
@@ -252,7 +257,7 @@ def ww_get_usage_for_range(start_ts, finit_ts, granularity='5m'):
         return None
     usage_data = {  # otherwise organised by timestamp to combine channels
         '_metadata_': {
-            'start_ts': start, 'finish_ts': finit,
+            'start_ts': int(start_ts), 'finish_ts': int(finit_ts),
             'captured_ts': datetime.now().timestamp(),
             'granularity': granularity,
         }
@@ -261,8 +266,12 @@ def ww_get_usage_for_range(start_ts, finit_ts, granularity='5m'):
     max_found_ts = 0
     for device, device_data in device_info.items():
         device_usage_data = ww_api_get(
-            'long-energy/' + device,
-            {'fromTs': start, 'toTs': finit, 'granularity': granularity}
+            'long-energy/{device}?fromTs={fromTs}&toTs={toTs}&granularity={g}'.format(
+                device=device,
+                fromTs=int(start_ts),
+                toTs=int(finit_ts),
+                g=granularity
+            )
         )
         # Get the minimum and maximum actual time stamps from the first
         # and last samples of the first channel of data we find
@@ -294,7 +303,9 @@ def ww_get_usage_for_range(start_ts, finit_ts, granularity='5m'):
         usage_data['_metadata_']['found_start_ts'] = min_found_ts
     if max_found_ts > 0:
         usage_data['_metadata_']['found_finish_ts'] = max_found_ts
-    print("Got usage data - keys:", usage_data.keys())
+    if args.verbose:
+        print("... got usage data - keys:", usage_data.keys())
+        print("... metadata:", usage_data['_metadata_'])
     return usage_data
 
 
@@ -319,6 +330,8 @@ def store_usage_data_in_data_dir(usage_data, data_dir):
         s=meta['found_start_ts'], f=meta['found_finish_ts'],
         g=meta['granularity']
     )
+    if args.verbose:
+        print(f"Storing usage data in '{filename}'")
     with open(path.join(data_dir, filename), 'w') as fh:
         json.dump(usage_data, fh)
 
@@ -349,8 +362,14 @@ def load_usage_data_from_data_dir(
         filename = ww_file_pattern.format(
             s=start_ts, f=finish_ts, g=granularity
         )
-    with open(path.join(data_dir, filename)) as fh:
-        return json.load(fh)
+    if args.verbose:
+        print(f"Trying to get data from {filename}...")
+    try:
+        with open(path.join(data_dir, filename)) as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        # No file, return empty
+        return {'_metadata_': {}}
 
 
 def get_usage_for_range(start_ts, finish_ts, granularity='5m'):
@@ -370,15 +389,19 @@ def get_usage_for_range(start_ts, finish_ts, granularity='5m'):
     started but not yet completed - e.g. a day that was previously partly
     fetched.
     """
+    if args.verbose:
+        print(f"Get usage from {start_ts:.0f} to {finish_ts:.0f} every {granularity}")
     usage_data = None
     if 'storage' in config and 'data_dir' in config['storage']:
         usage_data = load_usage_data_from_data_dir(
-            config['storage'], start_ts, finit_ts, granularity
+            config['storage']['data_dir'], start_ts, finish_ts, granularity
         )
         meta = usage_data['_metadata_']
         if not 'found_start_ts' in meta and not 'found_finish_ts' in meta:
             # Nothing in this data segment - fetch and return it.
-            return ww_get_usage_for_range(start_ts, finit_ts, granularity)
+            if args.verbose:
+                print("... No data in file...")
+            return ww_get_usage_for_range(start_ts, finish_ts, granularity)
         # Maybe we need to fill later samples in this data?  Check that its
         # metadata found start and end ranges are what we expect.  We only
         # check the end of this range - if there aren't any samples before the
@@ -387,11 +410,14 @@ def get_usage_for_range(start_ts, finish_ts, granularity='5m'):
         # range finish is 23:59:59 usually - round that down to the last
         # granularity range
         requested_finish_ts = finish_ts - valid_granularities[granularity] + 1
-        if found_finish_ts < requested_finish_ts:
-            rest_of_data = ww_get_usage_for_range(
-                found_finish_ts + valid_granularities[granularity],
-                finish_ts, granularity
-            )
+        if found_finish_ts >= requested_finish_ts:
+            if args.verbose:
+                print(f"... got data from file for range {meta['found_start_ts']} to {meta['found_finish_ts']}")
+            return usage_data
+        rest_of_data = ww_get_usage_for_range(
+            found_finish_ts + valid_granularities[granularity],
+            finish_ts, granularity
+        )
         # If we didn't get any more data, maybe we're requesting it too soon?
         if not 'found_start_ts' in rest_of_data['_metadata_']:
             # We can return our fetched data now
@@ -431,86 +457,26 @@ def store_usage_data_in_influxdb(usage_data):
     influxdb.write_points(data_points, time_precision='s')
 
 
-def store_channel_to_pvoutput(usage_data, pv_channel):
+def pv_channel_data_config():
     """
-    Find a particular channel of usage data and store that in PVOutput.
+    Get the PVOutput generation and consumption channel names from the
+    configuration file.
     """
-    pv_headers = {
-        'X-Pvoutput-Apikey': config['pvoutput']['api_key'],
-        'X-Pvoutput-SystemId': config['pvoutput']['system_id'],
-    }
-    if pv_channel not in usage_data:
-        pwrap(
-            f"Warning: channel '{pv_channel}' specified in config but not "
-            f"found in usage data"
-        )
-        return
-    parameters = {
-        'd': 'date', 't': 'time',
-        'v1': 'watt hours generated', 'v3': 'watt hours consumed',
-        'v6': 'mean volts RMS',
-    }
-    # At this time post all the timestamps of data we've got
-    response = requests.post(
-        pv_status_url,
-        data=parameters,
-        headers=pv_headers
-    )
-    assert response.status_code == 200
-
-
-def fetch_today():
-    """
-    Just fetch today's data from the WattWatcher site.
-    """
-    get_devices()
-    usage_data = get_daily_usage()
-    if 'storage' in config and 'data_dir' in config['storage']:
-        store_usage_data_in_data_dir(usage_data, config['storage']['data_dir'])
-    return usage_data
-
-
-def fetch_all_data():
-    """
-    Fetch all data, from the first day we can to now.
-    """
-    get_devices()
-    #
-    # if 'storage' in config and 'data_dir' in config['storage']:
-    #     store_usage_data_in_data_dir(
-    #         usage_data, config['storage']['data_dir']
-    #     )
-
-
-def push_pvoutput():
-    usage_data = fetch_today()
-    if all(
-        'pvoutput' in config,
-        'wattwatcher_channel' in config['pvoutput'],
-        config['pvoutput'].get('enabled', 'true') == 'true'
-    ):
-        store_channel_to_pvoutput(
-            usage_data, config['pvoutput']['wattwatcher_channel']
-        )
-
-
-def push_influxdb():
-    usage_data = fetch_today()
-    if all(
-        'influxdb' in config,
-        config['influxdb'].get('enabled', 'true') == 'true'
-    ):
-        store_usage_data_in_influxdb(usage_data)
-
-
-def update_current():
-    # Current time, truncate to nearest 5 minutes
     if 'pvoutput' not in config:
         return
     if 'generation_channel' not in config['pvoutput']:
         return
     pv_gen_channel = config['pvoutput']['generation_channel']
     pv_con_channel = config['pvoutput'].get('consumption_channel', None)
+    return (pv_gen_channel, pv_con_channel)
+
+
+def get_pv_channel_data(pv_gen_channel, pv_con_channel):
+    """
+    Get the WattWatchers devices and find the PVOutput generation and
+    consumption channels in them, returning the device and channel numbers
+    for each.
+    """
     get_devices()
     if pv_gen_channel not in channel_info:
         pwrap(
@@ -543,12 +509,157 @@ def update_current():
                 pv_con_channel = None
             else:
                 print(f"Channel {pv_con_channel} is device: {pv_con_device} port {pv_con_chan_no}")
+        return (pv_gen_device, pv_gen_chan_no, pv_con_device, pv_con_chan_no)
+    else:
+        return (pv_gen_device, pv_gen_chan_no, None, None)
+
+
+def store_usage_to_pvoutput(usage_data):
+    """
+    Find a particular channel of usage data and store that in PVOutput.
+    """
+    pv_gen_channel, pv_con_channel = pv_channel_data_config()
+    if not pv_gen_channel:
+        return
+    (
+        pv_gen_device, pv_gen_chan_no, pv_con_device, pv_con_chan_no
+    ) = get_pv_channel_data(pv_gen_channel, pv_con_channel)
+    pv_headers = {
+        'X-Pvoutput-Apikey': config['pvoutput']['api_key'],
+        'X-Pvoutput-SystemId': str(config['pvoutput']['system_id']),
+    }
+    sample_format = '{date},{time},{egen},{pgen},{econ},{pcon},,{mvol}'
+
+    print("Usage metadata:", usage_data['_metadata_'])
+    if args.verbose:
+        print(
+            f"Sending usage data from {usage_data['_metadata_']['found_start_ts']} "
+            f"to {usage_data['_metadata_']['found_start_ts']}..."
+        )
+    def batch_usage_data(batch_size=30):
+        """
+        Step through the time periods in this batch and output a batch output
+        string for the generation and consumption channels, assuming complete
+        contiguous samples from start_ts to (finish_ts mod granularity).
+        """
+        sample_outputs = []
+        sample_dt = datetime.fromtimestamp(usage_data['_metadata_']['found_start_ts'])
+        finish_dt = datetime.fromtimestamp(usage_data['_metadata_']['found_finish_ts'])
+        gran_tdel = timedelta(minutes=int(usage_data['_metadata_']['granularity'][:-1]))
+        while sample_dt <= finish_dt:
+            gen_sample = usage_data[pv_gen_channel][sample_dt.timestamp()]
+            gen_joules = gen_sample['eRealPositive']
+            gen_energy = int(gen_joules / 3600 + 0.5)
+            gen_power = int(gen_joules / gran_tdel.seconds + 0.5)
+            gen_volts = '{:.1f}'.format((gen_sample['vRMSMin'] + gen_sample['vRMSMax']) / 2)
+            if pv_con_channel:
+                con_joules = usage_data[pv_con_channel][sample_dt.timestamp()]['eRealPositive']
+                con_energy = int(con_joules / 3600 + 0.5)
+                con_power = int(con_joules / gran_tdel.seconds + 0.5)
+            else:
+                con_energy = ''
+                con_power = ''
+            sample_outputs.append(sample_format.format(
+                date=sample_dt.strftime('%Y%m%d'),
+                time=sample_dt.strftime('%H:%M'),
+                egen=gen_energy, pgen=gen_power,
+                econ=con_energy, pcon=con_power,
+                mvol=gen_volts,
+            ))
+            if len(sample_outputs) == batch_size:
+                yield ';'.join(sample_outputs)
+                sample_outputs = []
+            sample_dt += gran_tdel
+        yield ';'.join(sample_outputs)
+
+    # At this time post all the timestamps of data we've got
+    for delimited in batch_usage_data():
+        response = requests.post(
+            pv_base_url + 'addbatchstatus.jsp',
+            data={'data': delimited},
+            headers=pv_headers
+        )
+        print(response.content.decode())
+        # assert response.status_code == 200
+
+
+def fetch_today():
+    """
+    Just fetch today's data from the WattWatcher site.
+    """
+    if args.verbose:
+        print("Fetching all data for today")
+    get_devices()
+    start_of_today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    last_second_today = start_of_today + timedelta(days=1, seconds=-1)
+    usage_data = get_usage_for_range(
+        start_of_today.timestamp(), last_second_today.timestamp()
+    )
+    if 'storage' in config and 'data_dir' in config['storage']:
+        store_usage_data_in_data_dir(usage_data, config['storage']['data_dir'])
+    return usage_data
+
+
+def fetch_all_data():
+    """
+    Fetch all data, from the first day we can to now.
+    """
+    get_devices()
+    #
+    # if 'storage' in config and 'data_dir' in config['storage']:
+    #     store_usage_data_in_data_dir(
+    #         usage_data, config['storage']['data_dir']
+    #     )
+
+
+def push_pvoutput():
+    usage_data = fetch_today()
+    store_usage_to_pvoutput(usage_data)
+
+
+def pvoutput_for_date():
+    """
+    Fetch all data for a specific day and put it in PVOutput
+    """
+    if not args.date:
+        print("--date option required for `pvoutput-for-date` mode.")
+        exit(1)
+    if args.verbose:
+        print("Fetching all data for", args.date)
+    get_devices()
+    start_of_day = args.date
+    last_second_in_day = args.date + timedelta(days=1, seconds=-1)
+    usage_data = get_usage_for_range(
+        start_of_day.timestamp(), last_second_in_day.timestamp()
+    )
+    if 'storage' in config and 'data_dir' in config['storage']:
+        store_usage_data_in_data_dir(usage_data, config['storage']['data_dir'])
+    store_usage_to_pvoutput(usage_data)
+
+
+def push_influxdb():
+    usage_data = fetch_today()
+    if all(
+        'influxdb' in config,
+        config['influxdb'].get('enabled', 'true') == 'true'
+    ):
+        store_usage_data_in_influxdb(usage_data)
+
+
+def update_current():
+    (
+        pv_gen_channel, pv_gen_device, pv_gen_chan_no,
+        pv_con_channel, pv_con_device, pv_con_chan_no
+    ) = get_pv_channel_data()
+    if not pv_gen_channel:
+        return
     pv_headers = {
         'X-Pvoutput-Apikey': config['pvoutput']['api_key'],
         'X-Pvoutput-SystemId': str(config['pvoutput']['system_id']),
     }
 
     while True:
+        # Current time, truncate to nearest 5 minutes
         now = datetime.now()
         print(f"Now: {now} timestamp {now.timestamp()}")
         end_of_period = now.replace(
@@ -585,7 +696,7 @@ def update_current():
         # dividing by duration.  This is still reading an order of magnitude
         # lower than I'm expecting.
         parameters = {
-            'd': start_of_period.strftime('%Y%m%d'), 't': start_of_period.time().strftime('%H:%M'),
+            'd': start_of_period.strftime('%Y%m%d'), 't': start_of_period.strftime('%H:%M'),
             'v1': int(datapoint['eRealPositive'][pv_gen_chan_no] / datapoint['duration']),
             'v6': int((
                 datapoint['vRMSMin'][pv_gen_chan_no] + datapoint['vRMSMax'][pv_gen_chan_no]
@@ -596,7 +707,7 @@ def update_current():
         print("Parameters:", parameters)
         # At this time post all the timestamps of data we've got
         response = requests.post(
-            pv_status_url,
+            pv_base_url + 'addstatus.jsp',
             data=parameters,
             headers=pv_headers
         )
@@ -618,6 +729,7 @@ modes = {
     'fetch-all': fetch_all_data,
     'push-pvoutput': push_pvoutput,
     'push-influxdb': push_influxdb,
+    'pvoutput-for-date': pvoutput_for_date,
     'update-current': update_current,
 }
 
@@ -633,10 +745,25 @@ def parse_arguments():
         help='The YAML configuration file'
     )
     parser.add_argument(
+        '--date', '-d', action='store', default=None,
+        help='The date to fetch (for date-specific operations)'
+    )
+    parser.add_argument(
+        '--verbose', '-v', action='store_true', default=False,
+        help="Tell the user what is being done",
+    )
+    parser.add_argument(
         'mode', default='fetch', choices=modes,
         help='What to do'
     )
     args = parser.parse_args()
+    # Check arguments if necessary
+    if args.date:
+        try:
+            args.date = datetime.strptime(args.date, '%Y-%m-%d')
+        except:
+            print(f"Error: cannot parse '{args.date}' in YYYY-MM-DD format")
+            exit(1)
 
 
 ####################
