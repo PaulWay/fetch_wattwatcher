@@ -555,7 +555,10 @@ def update_current():
             minute=int(now.minute / 5) * 5, second=0, microsecond=0
         )
         start_of_period = end_of_period - timedelta(minutes=5)
-        print(f"Fetching data from {start_of_period} ({start_of_period.timestamp()}) to {end_of_period.timestamp()}")
+        print(
+            f"Fetching data from {start_of_period} ({start_of_period.timestamp()}) "
+            f"to {end_of_period} ({end_of_period.timestamp()})"
+        )
         device_usage_data = ww_api_get(
             'long-energy/{device}?fromTs={fromTs}&toTs={toTs}'.format(
                 device=pv_gen_device,
@@ -566,18 +569,30 @@ def update_current():
         assert isinstance(device_usage_data, list)
         datapoint = device_usage_data[0]
         print(f"From WattWatchers got timestamp {datapoint['timestamp']} <=> {start_of_period.timestamp()}")
-        print(f"... {datapoint['eReal'][pv_gen_chan_no]}J = {datapoint['eReal'][pv_gen_chan_no] / datapoint['duration']}Wh, min {datapoint['vRMSMin'][pv_gen_chan_no]}V max {datapoint['vRMSMax'][pv_gen_chan_no]}V")
+        print(
+            f"... {datapoint['eReal'][pv_gen_chan_no]}J = "
+            f"{datapoint['eReal'][pv_gen_chan_no] / datapoint['duration']}Wh, "
+            f"min {datapoint['vRMSMin'][pv_gen_chan_no]}V max {datapoint['vRMSMax'][pv_gen_chan_no]}V"
+        )
+        print(
+            f"... {datapoint['eReal'][pv_gen_chan_no]}J Real vs "
+            f"{datapoint['eReactive'][pv_gen_chan_no]}J"
+        )
 
-        # A Joule is a watt-second.  Divide by seconds in period.
+        # A Joule is a watt-second.  We could divide by 3600 to get watt-hours,
+        # then multiply by the number of periods in an hour (3600 / duration)
+        # to get watt-hours over an hour ... but in that case we're just
+        # dividing by duration.  This is still reading an order of magnitude
+        # lower than I'm expecting.
         parameters = {
             'd': start_of_period.strftime('%Y%m%d'), 't': start_of_period.time().strftime('%H:%M'),
-            'v1': datapoint['eReal'][pv_gen_chan_no] / datapoint['duration'],
-            'v6': (
+            'v1': int(datapoint['eRealPositive'][pv_gen_chan_no] / datapoint['duration']),
+            'v6': int((
                 datapoint['vRMSMin'][pv_gen_chan_no] + datapoint['vRMSMax'][pv_gen_chan_no]
-            ) / 2,
+            ) / 2),
         }
         if pv_con_channel:
-            parameters['v3'] = datapoint['eReal'][pv_con_chan_no] / datapoint['duration']
+            parameters['v3'] = int(datapoint['eRealPositive'][pv_con_chan_no] / datapoint['duration'])
         print("Parameters:", parameters)
         # At this time post all the timestamps of data we've got
         response = requests.post(
@@ -592,7 +607,7 @@ def update_current():
         # calculated if necessary, as well as possible clock misalignment.
         # Let's say 30 seconds past the end of the most recent period.
         delay=(end_of_period.timestamp() + 330) - time.time()
-        print(f"Sleeping {delay} seconds until {end_of_period + timedelta(seconds=330)}")
+        print(f"Sleeping {delay:.2f} seconds until {end_of_period + timedelta(seconds=330)}")
         time.sleep(delay)
 
 
