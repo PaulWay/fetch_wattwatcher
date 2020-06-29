@@ -29,7 +29,7 @@ args = None
 config = dict()
 ww_headers = dict()
 ww_base_url = 'https://api-v3.wattwatchers.com.au'
-ww_file_pattern = "wattwatcher_{s:.0f}-{f:.0f}_{g}.json"
+ww_file_pattern = "wattwatcher_{s}-{f}_{g}.json"
 pv_headers = dict()
 pv_base_url = 'https://pvoutput.org/service/r2/'
 device_info = dict()
@@ -336,40 +336,29 @@ def store_usage_data_in_data_dir(usage_data, data_dir):
         json.dump(usage_data, fh)
 
 
-def load_usage_data_from_data_dir(
-    data_dir, start_ts, finish_ts=None, granularity='5m'
-):
+def load_usage_data_from_data_dir(data_dir, start_ts, granularity='5m'):
     """
-    Load data from a file with these dates and granularity from the file
+    Load data from a file with this start and granularity from the file
     system.  There must be a file with the given start time; if 'finish_ts'
     is left as None, the file with that start time and the largest finish
     time possible will be loaded.
     """
-    if finish_ts is None:
-        file_glob = ww_file_pattern.format(
-            s=start_ts, f='*', g=granularity
+    file_glob = ww_file_pattern.format(
+        s=int(start_ts), f='*', g=granularity
+    )
+    matching_files = glob.glob(path.join(data_dir, file_glob))
+    if not matching_files:
+        pwrap(
+            f"Could not find any file named '{file_glob}' in '{data_dir}' "
+            f"to match starting timestamp '{start_ts}'"
         )
-        matching_files = glob.glob(path.join(data_dir, file_glob))
-        if not matching_files:
-            pwrap(
-                f"Could not find any file named '{file_glob}' in '{data_dir}' "
-                f"to match starting timestamp '{start_ts}'"
-            )
-            return {}
-        # Last one in sorted order will be with last matching end date
-        filename = sorted(matching_files)[-1]
-    else:
-        filename = ww_file_pattern.format(
-            s=start_ts, f=finish_ts, g=granularity
-        )
+        return {'_metadata_': {}}
+    # Last one in sorted order will be with last matching end date
+    filename = sorted(matching_files)[-1]
     if args.verbose:
         print(f"Trying to get data from {filename}...")
-    try:
-        with open(path.join(data_dir, filename)) as fh:
-            return json.load(fh)
-    except FileNotFoundError:
-        # No file, return empty
-        return {'_metadata_': {}}
+    with open(filename) as fh:
+        return json.load(fh)
 
 
 def get_usage_for_range(start_ts, finish_ts, granularity='5m'):
@@ -391,44 +380,58 @@ def get_usage_for_range(start_ts, finish_ts, granularity='5m'):
     """
     if args.verbose:
         print(f"Get usage from {start_ts:.0f} to {finish_ts:.0f} every {granularity}")
-    usage_data = None
-    if 'storage' in config and 'data_dir' in config['storage']:
-        usage_data = load_usage_data_from_data_dir(
-            config['storage']['data_dir'], start_ts, finish_ts, granularity
-        )
-        meta = usage_data['_metadata_']
-        if not 'found_start_ts' in meta and not 'found_finish_ts' in meta:
-            # Nothing in this data segment - fetch and return it.
-            if args.verbose:
-                print("... No data in file...")
-            return ww_get_usage_for_range(start_ts, finish_ts, granularity)
-        # Maybe we need to fill later samples in this data?  Check that its
-        # metadata found start and end ranges are what we expect.  We only
-        # check the end of this range - if there aren't any samples before the
-        # start of the day, maybe this is the first day?
-        found_finish_ts = meta['found_finish_ts']
-        # range finish is 23:59:59 usually - round that down to the last
-        # granularity range
-        requested_finish_ts = finish_ts - valid_granularities[granularity] + 1
-        if found_finish_ts >= requested_finish_ts:
-            if args.verbose:
-                print(f"... got data from file for range {meta['found_start_ts']} to {meta['found_finish_ts']}")
-            return usage_data
-        rest_of_data = ww_get_usage_for_range(
-            found_finish_ts + valid_granularities[granularity],
-            finish_ts, granularity
-        )
-        # If we didn't get any more data, maybe we're requesting it too soon?
-        if not 'found_start_ts' in rest_of_data['_metadata_']:
-            # We can return our fetched data now
-            return usage_data
-        # Check a couple of things here
-        # assert meta['finish_ts'] < rest_of_data['_metadata_']['start_ts']
-        # Merge these together:
-        # meta['finish_ts'] =
-
-    if not usage_data:
+    if not ('storage' in config and 'data_dir' in config['storage']):
+        if args.verbose:
+            print("... no storage, fetching whole range")
         return ww_get_usage_for_range(start_ts, finish_ts, granularity)
+
+    usage_data = load_usage_data_from_data_dir(
+        config['storage']['data_dir'], start_ts, granularity
+    )
+    meta = usage_data['_metadata_']
+    if 'found_start_ts' not in meta and 'found_finish_ts' not in meta:
+        # Nothing in this data segment - fetch and return it.
+        if args.verbose:
+            print("... No data in file...")
+        return ww_get_usage_for_range(start_ts, finish_ts, granularity)
+    # Maybe we need to fill later samples in this data?  Check that its
+    # metadata found start and end ranges are what we expect.  We only
+    # check the end of this range - if there aren't any samples before the
+    # start of the day, maybe this is the first day?
+    found_finish_ts = meta['found_finish_ts']
+    rest_start_ts = found_finish_ts + valid_granularities[granularity]
+    # range finish is 23:59:59 usually - round that down to the last
+    # granularity range
+    requested_finish_ts = finish_ts - valid_granularities[granularity] + 1
+    if found_finish_ts >= requested_finish_ts:
+        if args.verbose:
+            print(f"... got data from file for range {meta['found_start_ts']} to {meta['found_finish_ts']}")
+        return usage_data
+    if args.verbose:
+        print(
+            f"... file data from {meta['found_start_ts']} to "
+            f"{meta['found_finish_ts']}, fetching WattWatchers data from "
+            f"{rest_start_ts} to {finish_ts} and merging"
+        )
+    rest_of_data = ww_get_usage_for_range(
+        rest_start_ts, finish_ts, granularity
+    )
+    # If we didn't get any more data, maybe we're requesting it too soon?
+    if 'found_start_ts' not in rest_of_data['_metadata_']:
+        # We can return our fetched data now
+        return usage_data
+    # Check a couple of things here
+    assert rest_start_ts == rest_of_data['_metadata_']['start_ts']
+    # Merge these together:
+    meta['found_finish_ts'] = rest_of_data['_metadata_']['found_finish_ts']
+    meta['captured_ts'] = rest_of_data['_metadata_']['captured_ts']
+    for channel, channel_data in usage_data.items():
+        if channel != '_metadata_':
+            # Channel metadata should be updated
+            channel_data.update(rest_of_data[channel])
+    print("... merged metadata:", usage_data['_metadata_'])
+    print("... house keys:", usage_data['House'].keys())
+    return usage_data
 
 
 def store_usage_data_in_influxdb(usage_data):
@@ -528,14 +531,13 @@ def store_usage_to_pvoutput(usage_data):
         'X-Pvoutput-Apikey': config['pvoutput']['api_key'],
         'X-Pvoutput-SystemId': str(config['pvoutput']['system_id']),
     }
-    sample_format = '{date},{time},{egen},{pgen},{econ},{pcon},,{mvol}'
-
-    print("Usage metadata:", usage_data['_metadata_'])
+    sample_format = '{date},{time},,{pgen},,{pcon},,{mvol}'
     if args.verbose:
         print(
             f"Sending usage data from {usage_data['_metadata_']['found_start_ts']} "
             f"to {usage_data['_metadata_']['found_start_ts']}..."
         )
+
     def batch_usage_data(batch_size=30):
         """
         Step through the time periods in this batch and output a batch output
@@ -549,12 +551,10 @@ def store_usage_to_pvoutput(usage_data):
         while sample_dt <= finish_dt:
             gen_sample = usage_data[pv_gen_channel][sample_dt.timestamp()]
             gen_joules = gen_sample['eRealPositive']
-            gen_energy = int(gen_joules / 3600 + 0.5)
             gen_power = int(gen_joules / gran_tdel.seconds + 0.5)
             gen_volts = '{:.1f}'.format((gen_sample['vRMSMin'] + gen_sample['vRMSMax']) / 2)
             if pv_con_channel:
                 con_joules = usage_data[pv_con_channel][sample_dt.timestamp()]['eRealPositive']
-                con_energy = int(con_joules / 3600 + 0.5)
                 con_power = int(con_joules / gran_tdel.seconds + 0.5)
             else:
                 con_energy = ''
@@ -562,9 +562,7 @@ def store_usage_to_pvoutput(usage_data):
             sample_outputs.append(sample_format.format(
                 date=sample_dt.strftime('%Y%m%d'),
                 time=sample_dt.strftime('%H:%M'),
-                egen=gen_energy, pgen=gen_power,
-                econ=con_energy, pcon=con_power,
-                mvol=gen_volts,
+                pgen=gen_power, pcon=con_power, mvol=gen_volts,
             ))
             if len(sample_outputs) == batch_size:
                 yield ';'.join(sample_outputs)
@@ -579,8 +577,17 @@ def store_usage_to_pvoutput(usage_data):
             data={'data': delimited},
             headers=pv_headers
         )
-        print(response.content.decode())
-        # assert response.status_code == 200
+        if response.status_code == 200 and args.verbose:
+            resp_parts = response.content.decode().split(';')
+            s_date, s_time, _ = resp_parts[0].split(',')
+            f_date, f_time, _ = resp_parts[-1].split(',')
+            OKs = ','.join(
+                'OK' if p.split(',')[2] == '1' else 'bad'
+                for p in resp_parts
+            )
+            print(
+                f"Date {s_date} push from {s_time} to {f_time}: {OKs}"
+            )
 
 
 def fetch_today():
@@ -717,7 +724,7 @@ def update_current():
         # boundary, to allow for data to be transmitted to WattWatchers and
         # calculated if necessary, as well as possible clock misalignment.
         # Let's say 30 seconds past the end of the most recent period.
-        delay=(end_of_period.timestamp() + 330) - time.time()
+        delay = (end_of_period.timestamp() + 330) - time.time()
         print(f"Sleeping {delay:.2f} seconds until {end_of_period + timedelta(seconds=330)}")
         time.sleep(delay)
 
