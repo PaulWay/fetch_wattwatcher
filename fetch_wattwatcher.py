@@ -10,6 +10,7 @@ from influxdb import InfluxDBClient
 import json
 from os import environ, path
 import requests
+from requests.exceptions import Timeout
 import textwrap
 import time
 import yaml
@@ -30,8 +31,12 @@ config = dict()
 ww_headers = dict()
 ww_base_url = 'https://api-v3.wattwatchers.com.au'
 ww_file_pattern = "wattwatcher_{s}-{f}_{g}.json"
+ww_req_timeout = 120
+ww_retry_sleep = 5
 pv_headers = dict()
 pv_base_url = 'https://pvoutput.org/service/r2/'
+pv_retries = 120
+pv_retry_sleep = 5
 device_info = dict()
 channel_info = dict()
 influx_client = None
@@ -127,18 +132,56 @@ def ww_api_get(endpoint, parameters=None):
     Get an endpoint from the Wattwatchers API, optionally with a
     dictionary of parameters.
     """
-    response = requests.get(
-        f"{ww_base_url}/{endpoint}",
-        data=parameters,
-        headers=ww_headers
-    )
+    start_time = time.time()
+    success = False
+    while time.time() - start_time < ww_req_timeout and not success:
+        if args.verbose:
+            print(f"{time.time()}: Trying {ww_base_url}/{endpoint}...")
+        try:
+            response = requests.get(
+                f"{ww_base_url}/{endpoint}",
+                data=parameters,
+                headers=ww_headers
+            )
+            success = True
+        except requests.exceptions.ConnectionError:
+            print(f"Request connection error - retrying in {ww_retry_sleep} seconds")
+            time.sleep(ww_retry_sleep)
+
     if response.status_code != 200:
-        pwrap(
-            f"Error: GET {endpoint} returned status {response.status_code} - "
-            f"{response.data}"
-        )
-        exit(1)
+        errstr = f"Error: GET {endpoint} returned status {response.status_code} - "
+        if hasattr(response, 'data'):
+            errstr += response.data
+        pwrap(errstr)
+        # Better error handling...
     return response.json()
+
+
+def pv_api_post(endpoint, parameters=None, expected_status=200):
+    """
+    POST to an endpoint of the PVOutput API, optionally with a dict of
+    parameters.
+
+    This will retry if we get a timeout or the response status code does not
+    equal the given expected status.
+    """
+    success = False
+    try_num = 0
+    while not success and try_num < pv_retries:
+        try:
+            response = requests.post(endpoint, data=parameters, headers=pv_headers)
+            success = response.status_code == expected_status
+            if not success:
+                try_num += 1
+                print(
+                    f"Warning: Got a bad status {response.status_code} from PVOutput "
+                    f"('{response.content.decode()}') - retry {try_num} sleeping 5"
+                )
+                time.sleep(5)
+        except Timeout:
+            try_num += 1
+            print(f"Warning: Got a timeout POSTing to PVOutput - retry {try_num}")
+    return response
 
 
 def get_devices():
@@ -572,11 +615,7 @@ def store_usage_to_pvoutput(usage_data):
 
     # At this time post all the timestamps of data we've got
     for delimited in batch_usage_data():
-        response = requests.post(
-            pv_base_url + 'addbatchstatus.jsp',
-            data={'data': delimited},
-            headers=pv_headers
-        )
+        response = pv_api_post(pv_base_url + 'addbatchstatus.jsp', delimited)
         if response.status_code == 200 and args.verbose:
             resp_parts = response.content.decode().split(';')
             s_date, s_time, _ = resp_parts[0].split(',')
@@ -654,12 +693,12 @@ def push_influxdb():
 
 
 def update_current():
-    (
-        pv_gen_channel, pv_gen_device, pv_gen_chan_no,
-        pv_con_channel, pv_con_device, pv_con_chan_no
-    ) = get_pv_channel_data()
+    pv_gen_channel, pv_con_channel = pv_channel_data_config()
     if not pv_gen_channel:
         return
+    (
+        pv_gen_device, pv_gen_chan_no, pv_con_device, pv_con_chan_no
+    ) = get_pv_channel_data(pv_gen_channel, pv_con_channel)
     pv_headers = {
         'X-Pvoutput-Apikey': config['pvoutput']['api_key'],
         'X-Pvoutput-SystemId': str(config['pvoutput']['system_id']),
@@ -712,13 +751,10 @@ def update_current():
         if pv_con_channel:
             parameters['v4'] = int(datapoint['eRealPositive'][pv_con_chan_no] / datapoint['duration'])
         print("Parameters:", parameters)
-        response = requests.post(
-            pv_base_url + 'addstatus.jsp',
-            data=parameters,
-            headers=pv_headers
-        )
-        print(response.content.decode())
-        assert response.status_code == 200
+
+        response = pv_api_post(pv_base_url + 'addstatus.jsp', parameters)
+        if not success:
+            print("WARNING: Could not POST to PVOutput after {try_num} tries.  Online data incomplete!")
         # We want to sleep until a certain fudge factor past the five minute
         # boundary, to allow for data to be transmitted to WattWatchers and
         # calculated if necessary, as well as possible clock misalignment.
