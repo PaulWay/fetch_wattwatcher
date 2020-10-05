@@ -102,6 +102,11 @@ def read_config():
             "config"
         )
         exit(1)
+    global pv_headers
+    pv_headers = {
+        'X-Pvoutput-Apikey': config['pvoutput']['api_key'],
+        'X-Pvoutput-SystemId': str(config['pvoutput']['system_id']),
+    }
 
 
 def set_up_influxdb(influx_config):
@@ -168,6 +173,8 @@ def pv_api_post(endpoint, parameters=None, expected_status=200):
     success = False
     try_num = 0
     while not success and try_num < pv_retries:
+        if args.verbose:
+            print(f"Trying {endpoint} with data {parameters} headers {pv_headers}")
         try:
             response = requests.post(endpoint, data=parameters, headers=pv_headers)
             success = response.status_code == expected_status
@@ -570,10 +577,6 @@ def store_usage_to_pvoutput(usage_data):
     (
         pv_gen_device, pv_gen_chan_no, pv_con_device, pv_con_chan_no
     ) = get_pv_channel_data(pv_gen_channel, pv_con_channel)
-    pv_headers = {
-        'X-Pvoutput-Apikey': config['pvoutput']['api_key'],
-        'X-Pvoutput-SystemId': str(config['pvoutput']['system_id']),
-    }
     sample_format = '{date},{time},,{pgen},,{pcon},,{mvol}'
     if args.verbose:
         print(
@@ -592,6 +595,12 @@ def store_usage_to_pvoutput(usage_data):
         finish_dt = datetime.fromtimestamp(usage_data['_metadata_']['found_finish_ts'])
         gran_tdel = timedelta(minutes=int(usage_data['_metadata_']['granularity'][:-1]))
         while sample_dt <= finish_dt:
+            if sample_dt.timestamp() not in usage_data[pv_gen_channel]:
+                # Might have missed some time due to a power outage?
+                if args.verbose:
+                    print(f"Skipping {sample_dt} as not found in usage data?")
+                sample_dt += gran_tdel
+                continue
             gen_sample = usage_data[pv_gen_channel][sample_dt.timestamp()]
             gen_joules = gen_sample['eRealPositive']
             gen_power = int(gen_joules / gran_tdel.seconds + 0.5)
@@ -615,7 +624,7 @@ def store_usage_to_pvoutput(usage_data):
 
     # At this time post all the timestamps of data we've got
     for delimited in batch_usage_data():
-        response = pv_api_post(pv_base_url + 'addbatchstatus.jsp', delimited)
+        response = pv_api_post(pv_base_url + 'addbatchstatus.jsp', {'data': delimited})
         if response.status_code == 200 and args.verbose:
             resp_parts = response.content.decode().split(';')
             s_date, s_time, _ = resp_parts[0].split(',')
@@ -753,7 +762,7 @@ def update_current():
         print("Parameters:", parameters)
 
         response = pv_api_post(pv_base_url + 'addstatus.jsp', parameters)
-        if not success:
+        if response.status_code != 200:
             print("WARNING: Could not POST to PVOutput after {try_num} tries.  Online data incomplete!")
         # We want to sleep until a certain fudge factor past the five minute
         # boundary, to allow for data to be transmitted to WattWatchers and
