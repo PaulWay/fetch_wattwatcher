@@ -438,6 +438,13 @@ def get_usage_for_range(start_ts, finish_ts, granularity='5m'):
     usage_data = load_usage_data_from_data_dir(
         config['storage']['data_dir'], start_ts, granularity
     )
+    # Convert timestamps back to numbers
+    for circuit, circ_data in usage_data.items():
+        for key, val in circ_data.items():
+            if isinstance(key, str) and key.isdigit():
+                circ_data[int(key)] = val
+                del circ_data[key]
+
     meta = usage_data['_metadata_']
     if 'found_start_ts' not in meta and 'found_finish_ts' not in meta:
         # Nothing in this data segment - fetch and return it.
@@ -624,8 +631,10 @@ def store_usage_to_pvoutput(usage_data):
 
     # At this time post all the timestamps of data we've got
     for delimited in batch_usage_data():
+        if not delimited:  # no data?
+            continue
         response = pv_api_post(pv_base_url + 'addbatchstatus.jsp', {'data': delimited})
-        if response.status_code == 200 and args.verbose:
+        if response.status_code == 200:
             resp_parts = response.content.decode().split(';')
             s_date, s_time, _ = resp_parts[0].split(',')
             f_date, f_time, _ = resp_parts[-1].split(',')
@@ -733,6 +742,10 @@ def update_current():
             )
         )
         assert isinstance(device_usage_data, list)
+        if len(device_usage_data) == 0:
+            print("Warning!  Got no data from WattWatchers!  Sleep and retry?")
+            time.sleep(5)
+            continue
         datapoint = device_usage_data[0]
         print(f"From WattWatchers got timestamp {datapoint['timestamp']} <=> {start_of_period.timestamp()}")
         print(
