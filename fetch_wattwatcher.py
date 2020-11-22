@@ -139,6 +139,7 @@ def ww_api_get(endpoint, parameters=None):
     """
     start_time = time.time()
     success = False
+    response = None
     while time.time() - start_time < ww_req_timeout and not success:
         if args.verbose:
             print(f"{time.time()}: Trying {ww_base_url}/{endpoint}...")
@@ -153,7 +154,7 @@ def ww_api_get(endpoint, parameters=None):
             print(f"Request connection error - retrying in {ww_retry_sleep} seconds")
             time.sleep(ww_retry_sleep)
 
-    if response.status_code != 200:
+    if response and response.status_code != 200:
         errstr = f"Error: GET {endpoint} returned status {response.status_code} - "
         if hasattr(response, 'data'):
             errstr += response.data
