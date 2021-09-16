@@ -35,7 +35,7 @@ ww_req_timeout = 120
 ww_retry_sleep = 5
 pv_headers = dict()
 pv_base_url = 'https://pvoutput.org/service/r2/'
-pv_retries = 120
+pv_retries = 5
 pv_retry_sleep = 5
 device_info = dict()
 channel_info = dict()
@@ -159,7 +159,9 @@ def ww_api_get(endpoint, parameters=None):
         if hasattr(response, 'data'):
             errstr += response.data
         pwrap(errstr)
-        # Better error handling...
+        # Need better error handling...
+    elif not response:
+        return None
     return response.json()
 
 
@@ -182,7 +184,7 @@ def pv_api_post(endpoint, parameters=None, expected_status=200):
             if not success:
                 try_num += 1
                 print(
-                    f"Warning: Got a bad status {response.status_code} from PVOutput "
+                    f"Warning: Got a bad status {response.status_code} from PVOutput: "
                     f"('{response.content.decode()}') - retry {try_num} sleeping 5"
                 )
                 time.sleep(5)
@@ -722,6 +724,8 @@ def update_current():
         'X-Pvoutput-Apikey': config['pvoutput']['api_key'],
         'X-Pvoutput-SystemId': str(config['pvoutput']['system_id']),
     }
+    # A buffer of data that hasn't made it to PVOutput because of service unavailability...
+    backlog = []
 
     while True:
         # Current time, truncate to nearest 5 minutes
@@ -742,6 +746,10 @@ def update_current():
                 toTs=int(end_of_period.timestamp()),
             )
         )
+        if not device_usage_data:
+            print("Something went wrong with getting data from WattWatchers.  Retrying?")
+            time.sleep(5)
+            continue
         assert isinstance(device_usage_data, list)
         if len(device_usage_data) == 0:
             print("Warning!  Got no data from WattWatchers!  Sleep and retry?")
@@ -757,7 +765,7 @@ def update_current():
         if pv_con_channel:
             print(
                 f"... consumption: {datapoint['eRealPositive'][pv_con_chan_no]:.2f}J = "
-                f"{datapoint['eRealPositive'][pv_gen_chan_no] / datapoint['duration']}W"
+                f"{datapoint['eRealPositive'][pv_con_chan_no] / datapoint['duration']}W"
             )
 
 
@@ -775,14 +783,25 @@ def update_current():
             parameters['v4'] = int(datapoint['eRealPositive'][pv_con_chan_no] / datapoint['duration'])
         print("Parameters:", parameters)
 
-        response = pv_api_post(pv_base_url + 'addstatus.jsp', parameters)
-        if response.status_code != 200:
-            print("WARNING: Could not POST to PVOutput after {try_num} tries.  Online data incomplete!")
+        backlog.append(parameters)
+        pvoutput_working = True
+        while pvoutput_working and backlog:
+            response = pv_api_post(pv_base_url + 'addstatus.jsp', backlog[-1])
+            if response.status_code == 200:
+                backlog.pop()
+                if len(backlog):
+                    print(f"Have {len(backlog)} items in backlog, attempting to post them to PVOutput")
+            else:
+                print(f"WARNING: Could not POST to PVOutput.  Have {len(backlog)} backlog samples.  Waiting to retry.")
+                pvoutput_working = False
         # We want to sleep until a certain fudge factor past the five minute
         # boundary, to allow for data to be transmitted to WattWatchers and
         # calculated if necessary, as well as possible clock misalignment.
         # Let's say 30 seconds past the end of the most recent period.
         delay = (end_of_period.timestamp() + 330) - time.time()
+        if delay < 0:
+            print(f"Warning: waited {-delay:2d} secs too long for PVOutput, missed sample(s) from WattWatchers")
+            delay = (time.time() % 300) + 30
         print(f"Sleeping {delay:.2f} seconds until {end_of_period + timedelta(seconds=330)}")
         time.sleep(delay)
 
