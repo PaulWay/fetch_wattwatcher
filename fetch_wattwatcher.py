@@ -328,6 +328,11 @@ def ww_get_usage_for_range(start_ts, finit_ts, granularity='5m'):
         )
         # Get the minimum and maximum actual time stamps from the first
         # and last samples of the first channel of data we find
+        if len(device_usage_data) == 0:
+            pwrap(
+                f"WARNING: No data retrieved from {start_ts} to {end_ts}!"
+            )
+            continue
         if min_found_ts == 0:
             min_found_ts = int(device_usage_data[0]['timestamp'])
         if max_found_ts == 0:
@@ -800,7 +805,7 @@ def update_current():
         # Let's say 30 seconds past the end of the most recent period.
         delay = (end_of_period.timestamp() + 330) - time.time()
         if delay < 0:
-            print(f"Warning: waited {-delay:2d} secs too long for PVOutput, missed sample(s) from WattWatchers")
+            print(f"Warning: waited {-delay:.2f} secs too long for PVOutput, missed sample(s) from WattWatchers")
             delay = (time.time() % 300) + 30
         print(f"Sleeping {delay:.2f} seconds until {end_of_period + timedelta(seconds=330)}")
         time.sleep(delay)
